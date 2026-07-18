@@ -31,6 +31,55 @@ const CONTROL_EVENT_READ_CHUNK_BYTES = 64 * 1024;
 const MAX_CONTROL_EVENT_LINE_BYTES = 1024 * 1024;
 const CONTROL_EVENT_SCAN_WINDOW_BYTES = 2 * 1024 * 1024;
 
+/* 可以理解成父 Agent 里的一个后台任务状态管理器
+接收后台任务开始/完成事件
+        +
+轮询磁盘上的运行状态
+        +
+维护 state.asyncJobs 内存状态
+        +
+更新终端 Widget
+        +
+恢复任务和清理已完成任务 
+
+Tracker 的核心数据模型
+磁盘状态
+    status.json / events.jsonl / 进程状态
+                ↓ 同步
+内存状态
+    state.asyncJobs
+                ↓ 渲染
+终端 Widget
+
+磁盘状态更接近事实来源；state.asyncJobs 是为了快速显示和控制而维护的内存投影
+因此即使 Pi 重启、事件丢失，Tracker 也能重新从磁盘恢复
+*/
+
+/* 
+1. pi 
+是一个对象，它从 ExtensionAPI 类型中挑选（Pick）出 events 这个属性，其他属性全部被丢弃。
+它通过 EventBus 发出：
+- Subagent 控制事件
+- Intercom 通知事件
+
+2. state
+整个扩展共享的 SubagentState，主要操作：
+- state.asyncJobs
+- state.cleanupTimers
+- state.poller
+- state.lastUiContext
+其中最重要的是：
+- state.asyncJobs: Map<string, AsyncJobState>
+结构近似：runId -> 当前后台任务的内存状态 
+
+3. asyncDirRoot
+后台任务状态目录，例如：
+/tmp/pi-subagents-xxx/async-subagent-runs/
+    ├── run-001/
+    │   ├── status.json
+    │   └── events.jsonl
+    └── run-002/
+*/
 export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: SubagentState, asyncDirRoot: string, options: AsyncJobTrackerOptions = {}): {
 	ensurePoller: () => void;
 	handleStarted: (data: unknown) => void;
@@ -41,10 +90,15 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	const completionRetentionMs = options.completionRetentionMs ?? 10000;
 	const pollIntervalMs = options.pollIntervalMs ?? POLL_INTERVAL_MS;
 	const resultsDir = options.resultsDir ?? RESULTS_DIR;
+	/* 它完成两件事：
+	把 Map 中的任务转换成数组并渲染，通知终端立即刷新
+	默认渲染当前所有后台任务，也可以传空数组清除 Widget 上的任务列表
+	*/
 	const rerenderWidget = (ctx: ExtensionContext, jobs = Array.from(state.asyncJobs.values())) => {
 		renderWidget(ctx, jobs);
 		ctx.ui.requestRender?.();
 	};
+	// 恢复控制事件游标，用于记录已读到的位置，避免重复读取
 	const restoredControlEventCursor = (asyncDir: string) => {
 		try {
 			return fs.statSync(path.join(asyncDir, "events.jsonl")).size;
@@ -53,11 +107,20 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			throw error;
 		}
 	};
+	// 把磁盘上的运行状态转换成内存状态
+	// 它主要用于 Session 恢复：
+	// 磁盘中的 AsyncRunSummary
+	// 		↓
+	// summaryToJob()
+	// 		↓
+	// UI 使用的 AsyncJobState
 	const summaryToJob = (run: AsyncRunSummary): AsyncJobState => {
 		const groups = normalizeParallelGroups(run.parallelGroups, run.steps.length, run.chainStepCount ?? run.steps.length);
 		const activeGroup = run.currentStep !== undefined
 			? groups.find((group) => run.currentStep! >= group.start && run.currentStep! < group.start + group.count)
 			: undefined;
+		// Chain 的某一步可能又是一个并行组。Tracker 只把当前活跃组作为主要可见步骤
+		// 这样 Widget 不会同时把整条复杂 Chain 的所有步骤都当成正在执行
 		const visibleSteps = activeGroup
 			? run.steps.slice(activeGroup.start, activeGroup.start + activeGroup.count).map((step, index) => ({ ...step, index: activeGroup.start + index }))
 			: run.steps.map((step, index) => ({ ...step, index }));

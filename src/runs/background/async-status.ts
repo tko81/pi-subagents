@@ -10,72 +10,138 @@ import { flatToLogicalStepIndex, normalizeParallelGroups } from "./parallel-grou
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
 
 interface AsyncRunStepSummary {
+	// 当前步骤在整个任务中的索引
 	index: number;
+	// 执行该步骤的 Agent 名称
 	agent: string;
+	// 步骤的可读名称
 	label?: string;
+	// 当前步骤所属的执行阶段
 	phase?: string;
+	// 该步骤对应的输出名称
 	outputName?: string;
+	// 是否要求结构化输出
 	structured?: boolean;
+	// 当前步骤状态，例如 queued、running、complete、failed
 	status: AsyncJobStep["status"];
+	// 活动状态，例如长时间运行或需要人工注意
 	activityState?: ActivityState;
+	// 最近一次活动时间
 	lastActivityAt?: number;
+	// 当前正在调用的 Tool
 	currentTool?: string;
+	// 当前 Tool 的参数摘要
 	currentToolArgs?: string;
+	// 当前 Tool 的开始时间
 	currentToolStartedAt?: number;
+	// 当前正在操作的路径
 	currentPath?: string;
+	// 最近完成的 Tool 调用记录
 	recentTools?: Array<{ tool: string; args: string; endMs: number }>;
+	// 最近产生的文本输出
 	recentOutput?: string[];
+	// 已执行的 LLM Turn 数
 	turnCount?: number;
+	// 已调用的 Tool 数
 	toolCount?: number;
+	// 父 Agent 发送的 steer 消息次数
 	steerCount?: number;
+	// 最近一次 steer 的时间
 	lastSteerAt?: number;
+	// 当前步骤的运行时长
 	durationMs?: number;
+	// 当前步骤的 Token 使用量
 	tokens?: TokenUsage;
+	// 当前步骤的模型调用费用
 	totalCost?: CostSummary;
+	// 当前步骤加载的 Skills
 	skills?: string[];
+	// 当前步骤使用的模型
 	model?: string;
+	// 当前步骤的 Thinking / Reasoning 等级
 	thinking?: string;
+	// 主模型失败时尝试过的模型列表
 	attemptedModels?: string[];
+	// 当前步骤的失败原因
 	error?: string;
+	// 是否因超时结束
 	timedOut?: boolean;
+	// 是否被主动停止
 	stopped?: boolean;
+	// 当前步骤的 Turn 预算状态
 	turnBudget?: TurnBudgetState;
+	// 是否超过 Turn 预算
 	turnBudgetExceeded?: boolean;
+	// 是否已要求 Agent 进入收尾阶段
 	wrapUpRequested?: boolean;
+	// 当前步骤派生的嵌套子任务
 	children?: NestedRunSummary[];
 }
 
+// 后台 Subagent 任务的完整状态摘要，主要从 status.json 读取
 export interface AsyncRunSummary {
+	// 本次运行的唯一 ID
 	id: string;
+	// 该任务的后台状态目录
 	asyncDir: string;
+	// 所属父 Session
 	sessionId?: string;
+	// 运行状态
 	state: "queued" | "running" | "complete" | "failed" | "paused" | "stopped";
+	// 失败原因
 	error?: string;
+	// 长时间运行或需要人工注意
 	activityState?: ActivityState;
+	// 最后一次活动时间
 	lastActivityAt?: number;
+	// 当前正在使用的工具
 	currentTool?: string;
+	// 当前工具开始时间
 	currentToolStartedAt?: number;
+	// 当前操作的文件路径
 	currentPath?: string;
+	// LLM 已执行轮数
 	turnCount?: number;
+	// Tool 调用次数
 	toolCount?: number;
+	// 父 Agent 发送 steer 消息次数
+	// 子 Agent 运行过程中，父 Agent 可以发送 steer 消息来调整方向
 	steerCount?: number;
+	// 最近一次 steer 时间
 	lastSteerAt?: number;
+	// 运行模式：Single、Parallel 或 Chain
 	mode: SubagentRunMode;
+	// 子 Agent 工作目录，通常是扩展的临时目录
 	cwd?: string;
+	// 任务开始时间
 	startedAt: number;
+	// 状态最后更新时间
 	lastUpdate?: number;
+	// 任务结束时间
 	endedAt?: number;
+	// 最大运行时间
 	timeoutMs?: number;
+	// 绝对截止时间
 	deadlineAt?: number;
+	// 是否因超时结束
 	timedOut?: boolean;
+	// 是否因用户停止
 	stopped?: boolean;
+	// Turn 预算和当前使用状态
 	turnBudget?: TurnBudgetState;
+	// 是否超过 Turn 上限
 	turnBudgetExceeded?: boolean;
+	// 是否已要求 Agent 收尾总结
 	wrapUpRequested?: boolean;
+	// 当前执行到第几个步骤
 	currentStep?: number;
+	// Chain 总步骤数
 	chainStepCount?: number;
+	// 等待追加到 Chain 的任务数量
 	pendingAppends?: number;
+	// Chain 中哪些步骤组成并行组
 	parallelGroups?: AsyncParallelGroupStatus[];
+	// 每个子任务/步骤的状态摘要
 	steps: AsyncRunStepSummary[];
 	sessionDir?: string;
 	outputFile?: string;

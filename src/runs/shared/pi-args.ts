@@ -98,6 +98,14 @@ export function applyThinkingSuffix(model: string | undefined, thinking: string 
 	return `${model}:${thinking}`;
 }
 
+/* 存在 sessionFile
+    -> 子 Agent 使用指定 JSONL 文件
+
+不存在 sessionFile，但存在 sessionDir
+    -> 子 Agent 在该目录创建 Session
+
+都不存在，sessionEnabled=false
+    -> --no-session，不保存对话 */
 export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	const args = [...input.baseArgs];
 

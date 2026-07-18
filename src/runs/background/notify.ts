@@ -153,7 +153,14 @@ export function buildCompletionDetails(result: SubagentResult): SubagentNotifyDe
 		...(session ? { sessionLabel: session.label, sessionValue: session.value } : {}),
 	};
 }
-
+/* state.currentSessionId 用于过滤：
+完成事件 sessionId
+    === 当前 Session ID
+        -> 处理
+    !== 当前 Session ID
+        -> 忽略
+completionBatch 用于合并短时间内连续完成的成功任务。比如 4 个并行任务接近同时完成，可以合并成一次通知。
+失败和 needs_attention 通常不等待合并，而是立即通知。 */
 export default function registerSubagentNotify(
 	pi: ExtensionAPI,
 	state: Pick<SubagentState, "currentSessionId">,

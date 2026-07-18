@@ -344,7 +344,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const runtimeCleanupStoreKey = "__piSubagentRuntimeCleanup";
 	/* 	
 	读取上一次扩展加载时留下的清理函数，因为 Pi 支持重新加载扩展。重新加载 TypeScript 模块不等于销毁
-	整个 Node.js 进程，旧扩展创建的资源可能还活着。
+	整个 Node.js 进程，旧扩展创建的资源（例如 watcher、poller、timer、事件订阅）可能还活着
 
 	操作	       Pi进程  扩展代码	   当前会话
 	/reload	   通常不退出  重新加载	   通常保留
@@ -370,8 +370,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 
 	// 第三块：准备目录、读取配置和创建状态
 	// 这两个目录位于系统临时目录，分别用于：
-	// RESULTS_DIR：保存后台子 Agent 的最终结果和完成通知。
-	// ASYNC_DIR：保存后台运行的状态、事件和元数据。
+	// RESULTS_DIR：保存后台子 Agent 的最终结果和完成通知
+	// ASYNC_DIR：保存后台运行的状态、事件和元数据
+	// 之所以放在系统临时目录，是因为事件量可能很大，而且它只是运行期可观测数据，不承诺长期保留。macOS或扩展以后都可能清理它
 	ensureAccessibleDir(RESULTS_DIR);
 	ensureAccessibleDir(ASYNC_DIR);
 	cleanupOldChainDirs();
@@ -380,7 +381,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	// 配置文件不存在 -> 返回 {}
 	// 配置正确       -> 返回解析后的对象
 	// 配置错误       -> 打印错误，返回 {}
-	// 所以配置损坏不会阻止 Pi 启动，而是退回默认行为。
+	// 所以配置损坏不会阻止 Pi 启动，而是退回默认行为
 	const config = loadConfig();
 	/* 
 	把“环境变量配置”和“配置文件配置”合并，最终得到一个确定的 { enabled: boolean }。
@@ -1034,12 +1035,62 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			return renderSubagentResult(result, options, theme, frame);
 		},
 	};
-	// 正式注册 Tool
+
+	// 正式注册 Tool:这一行才把前面创建的 tool 加入 Pi Tool Registry
+	// 执行前：
+	// tool只是 index.ts 中的局部对象
+	// AI看不到它
+	// Agent Loop也找不到它
+	// 执行后：
+	// Pi Tool Registry
+	// 	└── subagent
+	// 		  ├── description
+	// 		  ├── parameters
+	// 		  ├── execute
+	// 		  ├── renderCall
+	// 		  └── renderResult
+	// 之后请求 LLM时，Pi会把 subagent 的：
+	// name
+	// description
+	// parameters
+	// 转换成模型可见的 Function Tool。
 	pi.registerTool(tool);
 
+	// 定义 wait Tool，用来等待异步子 Agent完成
+	// 模型最终会生成：
+	// {
+	// 	"name": "wait",
+	// 	"arguments": {
+	// 	  "all": true
+	// 	}
+	// }
 	const waitTool: ToolDefinition<typeof WaitParams, Details> = {
 		name: "wait",
 		label: "Wait",
+		/* 阻塞，直到本次会话中启动的后台（异步）子代理任务全部完成，然后返回。
+
+		在你启动异步子代理之后使用，当你没有其他独立工作可做，且不能结束当前轮次时——比如在一个必须运行完成的 skill 内部
+		或者在任何一个非交互式执行（pi -p ...）中，整个任务只有一个轮次，结束它会导致仍在运行的子任务被遗弃。
+		
+		• { } —— 等待当前任务集合中第一个任务完成，适合滚动并发：
+			启动 4 个任务
+			-> wait 等到一个完成
+			-> 再补一个
+			-> 始终保持 4 个任务运行
+		
+		• { all: true } —— 阻塞，直到本次会话中所有活跃任务全部完成。
+		
+		• { id: "..." } —— 等待某个特定任务（通过完整 id 或前缀匹配）完成。
+		
+		• { timeoutMs: 600000 } —— 等待期间持续监听和检查，在 N 毫秒后停止等待（任务会继续运行不受影响；默认 30 分钟）。
+		
+		wait 不仅会在任务完成时返回，当某个任务需要关注时（比如子任务进入空闲状态，或卡住等待决策）也会返回——这样卡住的子
+		任务永远不会阻塞整个循环；返回的摘要信息中会指出需要检查/催促/恢复/中断的任务。
+		
+		它在完成事件或控制事件到达的瞬间就会被唤醒（通过订阅 Pi 的事件总线，并配合轮询兜底机制来处理崩溃的 runner），保持当
+		前轮次存活以确保正常通知能够送达，如果轮次被中止则提前 resolve。
+		
+		配置行为：如果通过 config.waitTool 或 PI_SUBAGENT_WAIT_TOOL_ENABLED 禁用了 wait，则它会立即返回，不阻塞。 */
 		description: `Block until background (async) subagent runs started in this session finish, then return.
 
 Use this after launching async subagents when you have no independent work left and must not end your turn — for example inside a skill that has to run to completion, or any non-interactive run (\`pi -p ...\`) where the whole task is a single turn and ending it would abandon the still-running children.
@@ -1050,35 +1101,56 @@ Use this after launching async subagents when you have no independent work left 
 • { timeoutMs: 600000 } — stop waiting after N ms (the runs keep going regardless; default 30 min)
 
 wait also returns when a run needs attention (a child that went idle or blocked for a decision), not only on completion — so a stuck child never stalls the loop; the summary names the run(s) to inspect/nudge/resume/interrupt. It wakes the instant a completion or control event arrives (subscribed to Pi's event bus, with a poll fallback that reconciles crashed runners), keeps the turn alive for normal notification delivery, and resolves early if the turn is aborted.${waitToolConfig.enabled ? "" : "\n\nConfigured behavior: wait is disabled by config.waitTool or PI_SUBAGENT_WAIT_TOOL_ENABLED and returns immediately without blocking."}`,
-		parameters: WaitParams,
+		parameters: WaitParams, // 参数类型是定义 /extension/schemas.ts L299 
 		execute(_id, params, signal, _onUpdate, _ctx) {
+			// state 读取当前 Session 的 asyncJobs 等运行状态。
+			// pi.events 订阅后台任务完成和控制事件。相比纯轮询，任务完成时可以立即唤醒
+			// enabled 如果禁用，立即返回，不真正阻塞
+			// waitForSubagents() 内部还保留轮询兜底：EventBus 事件唤醒+定期扫描磁盘状态，即使后台进程崩溃、完成事件丢失，也有机会从持久化状态发现变化
 			return waitForSubagents(params, signal, { state, events: pi.events, enabled: waitToolConfig.enabled });
 		},
 	};
+	// 到这里 wait 才真正注册到 Pi，之后 LLM 才能看到并调用它
 	pi.registerTool(waitTool);
 
+	// 注册 Slash 命令，这里注册用户在终端直接输入的 Subagent 命令
+	// Slash 命令和 Tool 两者最终可以共享同一份 state，所以 Slash 命令能够查看和控制 Tool 启动的任务
 	registerSlashCommands(pi, state);
 
+	/* 准备热重载清理键
+	它们会作为 globalThis 的字段名。
+	eventUnsubscribeStoreKey：保存事件取消订阅函数。
+	controlNoticeSeenStoreKey：保存已经显示过的控制通知。
+	使用全局对象是因为 /reload 会创建新扩展实例，但 Node 进程和 globalThis 可能仍然存在 */
 	const eventUnsubscribeStoreKey = "__piSubagentEventUnsubscribes";
 	const controlNoticeSeenStoreKey = "__piSubagentVisibleControlNotices";
+	// 清理上一次加载的事件订阅，读取旧扩展留下的取消订阅函数数组，逐个处理旧订阅
 	const previousEventUnsubscribes = globalStore[eventUnsubscribeStoreKey];
 	if (Array.isArray(previousEventUnsubscribes)) {
 		for (const unsubscribe of previousEventUnsubscribes) {
+			// 全局数据的类型不可信，调用前先检查
 			if (typeof unsubscribe !== "function") continue;
 			try {
+				// 取消旧监听器，失败不会阻止新扩展加载，如果不清理，/reload 后一个完成事件可能被处理多次
 				unsubscribe();
 			} catch {
 				// Best effort cleanup for stale handlers from an older reload.
 			}
 		}
 	}
+	// 注册后台完成通知，它主要订阅后台任务完成事件，然后向父 Agent发送可见通知
 	registerSubagentNotify(pi, state, { batchConfig: config.completionBatch });
 
+	// 恢复通知去重集合，尝试读取旧实例保存的去重集合，如果已经是 Set 就继续复用，否则新建。
+	// 为什么热重载后还要复用？因为控制事件可能已经显示过。若 /reload 后清空去重记录，同一个 needs_attention 事件可能再次弹出。
 	const existingVisibleControlNotices = globalStore[controlNoticeSeenStoreKey];
 	const visibleControlNotices =
 		existingVisibleControlNotices instanceof Set ? (existingVisibleControlNotices as Set<string>) : new Set<string>();
+	// 把集合写回全局对象，供当前实例和未来重载实例使用
 	globalStore[controlNoticeSeenStoreKey] = visibleControlNotices;
+	// 包装控制事件处理器，EventBus 传入的数据先视为 unknown
 	const controlEventHandler = (payload: unknown) => {
+		// 处理控制事件，payload 是控制事件的详细信息
 		handleSubagentControlNotice({
 			pi,
 			state,
@@ -1086,29 +1158,101 @@ wait also returns when a run needs attention (a child that went idle or blocked 
 			details: payload as SubagentControlMessageDetails,
 		});
 	};
+	/* 订阅三个后台事件，数组中保存的是取消订阅函数
+
+	监听 subagent:async-started。收到后，handleStarted 会：
+	- 将任务加入 state.asyncJobs
+	- 记录 PID、模式、Agent 和超时
+	- 启动 Poller
+	- 更新 Widget
+
+	监听 subagent:async-complete。收到后会：
+	- 更新任务状态为 complete/failed
+	- 更新完成时间
+	- 刷新嵌套子任务
+	- 重绘 Widget
+	- 安排清理
+
+	监听 subagent:control-event，处理长时间运行或需要干预等控制通知 
+
+	Widget 是终端中显示后台任务状态的区域。
+	刷新前可能是：
+	researcher  running
+	scout-1   running
+	scout-2   running
+	收到完成事件后刷新为：
+	researcher  running
+	scout-1   complete
+	scout-2   running
+	*/
 	const eventUnsubscribes = [
 		pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, handleStarted),
 		pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, handleComplete),
 		pi.events.on(SUBAGENT_CONTROL_EVENT, controlEventHandler),
-		rpcBridge.dispose,
+		rpcBridge.dispose, // 它不是事件订阅，而是一个清理函数。放进相同数组，是为了在 Session 关闭或热重载时统一调用
 	];
+	// 保存当前实例的清理函数，下一次 /reload 可以先取消这些旧订阅
 	globalStore[eventUnsubscribeStoreKey] = eventUnsubscribes;
 
+	// 监听 subagent Tool Result，这是 Pi 生命周期事件，不是扩展自定义 EventBus
+	// 机制					事件来源		   事件名称
+	// Agent.subscribe() Agent Loop	固定的   AgentEvent
+	// pi.on()			  Pi 扩展生命周期	  Pi 预定义事件
+	// pi.events()		   扩展自己发布		  自定义频道
 	pi.on("tool_result", (event, ctx) => {
+		// 只处理 subagent Tool，不处理 bash、read、wait 等其他工具
 		if (event.toolName !== "subagent") return;
+		// 非交互模式没有终端 Widget，这种情况不做 UI 更新
 		if (!ctx.hasUI) return;
+		// 保存最新可用 UI Context，供之后异步完成事件使用
 		state.lastUiContext = ctx;
+		// 只有存在后台任务才显示 Widget。同步子 Agent 已经直接返回结果，不需要后台状态栏
 		if (state.asyncJobs.size > 0) {
+			// 将 Map 中的后台任务转换成数组并渲染，例如显示：
+			// worker running  2m  turns=4  tools=7
 			renderWidget(ctx, Array.from(state.asyncJobs.values()));
+			// 请求终端立即重绘
 			ctx.ui.requestRender?.();
+			// 确保后台状态轮询器已经启动
+			// 子 Agent会把最新状态写入自己的运行目录，例如：
+			// asyncDir/
+			// ├── status.json
+			// ├── events.jsonl
+			// ├── output-0.log
+			// └── result.json
+			// poller轮询器周期性读取这些文件，把最新状态同步到：
+			// state.asyncJobs
+			// 然后刷新终端 Widget。
 			ensurePoller();
 		}
 	});
 
+
+
+	/* 
+	下面这段代码负责 Subagent 扩展与 Pi Session 的绑定和解绑
+	Session 启动
+	-> 绑定当前 cwd/sessionId
+	-> 清空上一个 Session 的内存状态
+	-> 从磁盘恢复当前 Session 的后台任务
+	-> 恢复 UI 和计划任务
+	-> 启动 RPC/Supervisor
+
+	Session 关闭
+	-> 取消事件订阅
+	-> 停止 Watcher/Poller/Timer
+	-> 清空内存和 UI
+	-> 释放通信通道 
+	*/
+
+	// 定义一个清理当前 Session 过期产物的函数
 	const cleanupSessionArtifacts = (ctx: ExtensionContext) => {
 		try {
+			// 获取当前 Session 的 JSONL 文件
 			const sessionFile = ctx.sessionManager.getSessionFile();
-			if (sessionFile) {
+			if (sessionFile) { // 有些内存 Session 可能没有文件，因此先判断
+				// 根据父 Session 文件计算对应的 Artifact 目录
+				// 里面可能保存：子 Agent 的完整输出、Transcript、被截断的原始结果、中间执行产物。cleanupDays 表示只清理超过保留天数的旧文件。
 				cleanupOldArtifacts(getArtifactsDir(sessionFile), DEFAULT_ARTIFACT_CONFIG.cleanupDays);
 			}
 		} catch {
@@ -1116,39 +1260,83 @@ wait also returns when a run needs attention (a child that went idle or blocked 
 		}
 	};
 
+	// 它是 Session 启动时的核心函数，名字虽然是 reset，实际职责是：清理旧 Session 的内存投影 + 绑定并恢复当前 Session。
 	const resetSessionState = (ctx: ExtensionContext) => {
+		// 子 Agent没有显式指定 cwd 时，可以使用父 Session 的工作目录
 		state.baseCwd = ctx.cwd;
+		// 确定当前 Session 身份，通常优先使用 Session 文件路径，没有文件时使用 Session ID
+		// 后台任务会记录所属 sessionId。恢复任务时只恢复属于当前 Session 的任务，避免多个会话串数据
 		state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
+		// 重置子 Agent 派生计数 记录当前 Session 已启动多少个子 Agent。
+		// 切换到新 Session 后计数重新开始，用于限制单个 Session 的最大 spawn 数量。
 		state.subagentSpawns = { sessionId: state.currentSessionId, count: 0 };
-		// Set PI_SUBAGENT_PARENT_SESSION for permission-system forwarding.
-		// Only set in the root session (the interactive UI session), not in
-		// child subagent processes — children inherit the parent's value
-		// through the process environment at spawn time and must not overwrite
-		// it with their own session identity.
+		/* 设置父 Session 环境变量，判断当前进程是不是根 Agent。只有根 Agent才能设置：SUBAGENT_PARENT_SESSION_ENV
+		父进程之后使用 spawn() 启动子 Agent时，子进程会继承这个变量。
+		它主要用于：
+		父子 Session 关联
+		权限请求转发
+		Supervisor 消息路由
+		判断任务属于哪个根会话
+		为什么子 Agent不能覆盖？
+		根 Session A
+		  -> 子 Agent B
+			  -> 嵌套子 Agent C
+		B 和 C 都应该保留“根 Session 是 A”，而不是把父 Session 改成自己。 */
 		if (!process.env[SUBAGENT_CHILD_ENV]) {
 			const sessionId = ctx.sessionManager.getSessionId();
 			if (sessionId) {
+				// PI_SUBAGENT_PARENT_SESSION=<根Session ID>
 				process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId;
 			}
 		}
+		// 保存最新 UI Context 后台任务完成时，执行回调的不是某个 pi.on(...) 生命周期 Hook
+		// 因此回调参数里通常没有 ExtensionContext ctx；但更新终端 UI 又需要 ctx.ui，所以提前保存最近一次拿到的 ctx。
 		state.lastUiContext = ctx;
+		// 清理当前 Session 的旧 Artifact
 		cleanupSessionArtifacts(ctx);
+		// 清除待发送的控制通知，取消上一个 Session 还没发送的通知 Timer
+		// 例如：任务长时间运行、任务需要干预、子 Agent 疑似卡住。避免旧通知出现在新 Session 中。
 		clearPendingForegroundControlNotices(state);
+		// 清空内存任务状态，它会清除：state.asyncJobs、前台控制状态、旧任务清理 Timer
+		// Widget 中的旧任务、待处理的结果文件。这里是先清空，再恢复当前 Session。
 		resetJobs(ctx);
+		// 恢复后台任务,从持久化目录读取属于当前 Session 且状态为 queued 或 running 的后台任务
+		// 然后重新加入 state.asyncJobs。如果恢复到后台任务，还会重新启动 Poller 和 Widget
+		// 这里不会重新 spawn 子 Agent，只是恢复对已有进程或任务状态的追踪。
 		restoreActiveJobs(ctx);
+		// 绑定计划任务
 		scheduledRunManager.bindSession(ctx);
+		// 恢复 Slash 命令结果 从 JSONL Session 历史中读取已保存的 Slash Subagent 结果。
+		// 这样重新打开 Session 后，之前的结果仍然可以正确渲染。
 		restoreSlashFinalSnapshots(ctx.sessionManager.getEntries());
+		// 扫描遗漏的结果文件
+		// 主动扫描结果目录中已经存在的 .json 文件。
+		// 因为子 Agent可能在这些阶段完成：
+		// Pi 关闭期间
+		// Watcher 尚未启动时
+		// Session 切换期间
+		// 扩展 /reload 期间
+		// 这些文件不会触发新的 fs.watch 事件，因此启动时必须补扫一次。
 		primeExistingResults();
 	};
 
+	// 订阅 Pi 的 Session 启动事件。_event 没被使用，所以用下划线标记。
 	pi.on("session_start", (_event, ctx) => {
+		// 先完成当前 Session 的清理、绑定和状态恢复
 		resetSessionState(ctx);
+		// 通过 RPC Bridge 发出“当前 Subagent 扩展已准备完成”的信号。
+		// 外部 RPC 调用方收到 Ready 后，才适合发起任务。
 		rpcBridge.emitReady(ctx);
+		// 启动父子 Agent Supervisor 通道，用于：子 Agent 联系父 Agent、权限和决策请求、控制消息、
+		// needs_attention、父 Agent 回复子 Agent。注意，这里只启动通信设施，没有创建具体子 Agent。
 		supervisorChannel.start();
 	});
 
+	// Session 关闭时，释放当前扩展占用的资源
 	pi.on("session_shutdown", () => {
+		// 清理父 Session 环境变量，防止后续 Session 错误继承旧 Session ID
 		delete process.env[SUBAGENT_PARENT_SESSION_ENV];
+		// 取消 EventBus 订阅，包括：后台完成通知、轮询器、计划任务、Slash 结果、结果文件监视器
 		for (const unsubscribe of eventUnsubscribes) {
 			try {
 				unsubscribe();
@@ -1156,13 +1344,18 @@ wait also returns when a run needs attention (a child that went idle or blocked 
 				// Best effort cleanup during shutdown.
 			}
 		}
+		// 清理全局订阅记录
 		if (globalStore[eventUnsubscribeStoreKey] === eventUnsubscribes) {
 			delete globalStore[eventUnsubscribeStoreKey];
 		}
+		// 停止结果 Watcher
 		stopResultWatcher();
+		// 停止计划任务管理器
 		scheduledRunManager.stop();
+		// 停止 Poller 轮询器
 		if (state.poller) clearInterval(state.poller);
 		state.poller = null;
+		// 清理前台通知与任务 Timer
 		clearPendingForegroundControlNotices(state);
 		for (const timer of state.cleanupTimers.values()) {
 			clearTimeout(timer);

@@ -563,6 +563,7 @@ export interface ArtifactPaths {
 	metadataPath: string;
 }
 
+// 记录 Artifact 配置，包括是否启用、是否包含输入、输出、JSONL、Transcript、Metadata，以及清理天数
 export interface ArtifactConfig {
 	enabled: boolean;
 	includeInput: boolean;

@@ -262,6 +262,11 @@ function normalizeCriteria(criteria: Array<string | { id?: string; must?: string
 	}).filter((criterion) => criterion.must.trim());
 }
 
+// 验收规则可能来自：
+// 用户显式配置
+// Agent 默认配置
+// 任务类型推断
+// Single/Parallel/Chain 运行模式
 export function resolveEffectiveAcceptance(input: {
 	explicit?: AcceptanceInput;
 	agentName: string;
@@ -301,8 +306,26 @@ export function resolveEffectiveAcceptance(input: {
 	};
 }
 
+/* 
+verify：已经完整落地，能够执行 lint/test/build。
+review：有数据结构和验收逻辑，但当前代码不会根据 review.agent 自动派生 Reviewer 子 Agent
+stopRules：只有 Prompt 注入，没有确定性执行。
+criteriaSatisfied：在 checked 以上会被上层真实检查。
+
+最准确的定位是：
+Acceptance 已经是“子 Agent 自证 + 父进程结构检查 + 确定性命令验证”的轻量 Harness；但自动 Reviewer 和验收失败后的自动续跑还没有闭环。 
+*/
 export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig): string {
+	// 如果验收级别是 "none"，直接返回空字符串
 	if (acceptance.level === "none") return "";
+	// 构建报告头部（lines 数组）
+	// level 验收严格程度（如 "standard"、"strict"）
+	// criteria	验收标准列表，每个标准有 id 和 must（必须满足的条件） 如果没有定义 criteria，会使用默认提示："- Return the requested result."
+	// evidence	需要提供的证据类型列表
+	// verify	运行时验证命令列表
+	// review	审查门（可选）
+	// stopRules	停止规则列表
+	// reason	验收失败原因
 	const lines = [
 		"",
 		"## Acceptance Contract",
@@ -314,17 +337,39 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig): st
 		"",
 		`Required evidence: ${acceptance.evidence.join(", ") || "none"}`,
 	];
+	// 如果配置了运行时验证命令，添加到提示中
+	// 父 Agent 可以配置一些需要在子 Agent 执行时运行的验证命令（如健康检查、单元测试）
 	if (acceptance.verify.length > 0) {
 		lines.push("", "Runtime verification commands configured by parent:");
 		for (const command of acceptance.verify) lines.push(`- ${command.id}: ${command.command}`);
 	}
+	// 审查门禁：是否需要人工或另一个人审查，以及审查的重点是什么
+	// required	是否强制审查
+	// agent	指定谁来审查（如 "security-agent"）
+	// focus	审查的重点方向
 	if (acceptance.review && acceptance.review !== false) {
 		lines.push("", `Review gate: ${acceptance.review.required === false ? "optional" : "required"}${acceptance.review.agent ? ` by ${acceptance.review.agent}` : ""}.`);
 		if (acceptance.review.focus) lines.push(`Review focus: ${acceptance.review.focus}`);
 	}
+	// 如果配置了停止规则，添加到提示中
+	// 父 Agent 可以配置一些需要在子 Agent 执行时停止的条件（如达到最大执行时间、超出预算、遇到严重错误）
 	if (acceptance.stopRules.length > 0) {
 		lines.push("", "Stop rules:", ...acceptance.stopRules.map((rule) => `- ${rule}`));
 	}
+	// 最后，构建验收报告的 JSON 结构
+	// 验收报告是子 Agent 必须输出的结构化内容，用于验收和评估
+	// 验收报告的结构是固定的，包含以下字段：
+	// criteriaSatisfied	验收标准是否满足
+	// changedFiles	变更的文件列表
+	// testsAddedOrUpdated	新增或更新的测试文件列表
+	// commandsRun	运行时验证命令结果
+	// validationOutput	运行时验证输出
+	// residualRisks	剩余风险列表
+	// noStagedFiles	是否没有未暂存的文件
+	// diffSummary	差异摘要
+	// reviewFindings	审查发现
+	// manualNotes	手动备注
+	// 注意：所有字段都是可选的，可以为空数组或空字符串
 	lines.push(
 		"",
 		"Finish with a fenced JSON block tagged `acceptance-report` in this shape:",
@@ -344,6 +389,7 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig): st
 		}, null, 2),
 		"```",
 	);
+	// 把 lines 数组用换行符拼接成一个完整的字符串
 	return lines.join("\n");
 }
 
