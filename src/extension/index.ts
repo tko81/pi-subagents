@@ -813,7 +813,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		onUpdate: ((result: AgentToolResult<Details>) => void) | undefined,
 		ctx: ExtensionContext,
 	) => {
-		/* ctx.hasUI 表示当前是不是交互式终端，把 Tool详情默认设置成折叠状态。
+		/* ctx.hasUI 表示当前是交互式终端，需要把 Tool 详情默认设置成折叠状态
 		原因是子 Agent执行时可能产生大量：
 		中间输出
 		Tool Call
@@ -843,12 +843,38 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		return executor.execute(id, params, signal, onUpdate, ctx);
 	};
 
+	//===============================================
+	// slashBridge 和 promptTemplateBridge 都是把“非 Tool 调用”接到 Subagent Executor
+	//===============================================
+	
+	/* 注册 Slash 桥接器，它负责处理 Slash 命令的执行
+	处理用户在终端输入的 Slash 命令：
+	/subagent worker 分析代码
+	→ Slash Bridge
+	→ executor.execute()
+	调用者是用户。
+	 */
 	const slashBridge = registerSlashSubagentBridge({
 		events: pi.events,
+		// Slash Bridge 是通过事件触发的，没有普通 Tool Call 自动传入的 ctx，每次执行都拿到最新 Session 的 Context
 		getContext: () => state.lastUiContext,
 		execute: (id, params, signal, onUpdate, ctx) => executeSubagentCollapsed(id, params, signal, onUpdate, ctx),
 	});
 
+	/* 注册 Prompt Template 桥接器，它负责处理 Prompt Template 的执行
+	处理 Prompt Template 中声明的 Subagent 委托：
+	---
+	subagent: worker
+	model: kimi
+	---
+
+	分析 $@
+	执行时：
+	Prompt Template
+	→ PromptTemplate Bridge
+	→ executor.execute()
+	调用者是 Prompt 模板系统
+	 */
 	const promptTemplateBridge = registerPromptTemplateDelegationBridge({
 		events: pi.events,
 		getContext: () => state.lastUiContext,

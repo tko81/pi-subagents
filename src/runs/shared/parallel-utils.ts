@@ -88,30 +88,35 @@ export function flattenSteps(steps: RunnerStep[]): RunnerSubagentStep[] {
 export const DEFAULT_GLOBAL_CONCURRENCY_LIMIT = 20;
 
 /**
- * A promise-based semaphore for limiting concurrent access across multiple
- * mapConcurrent calls within a single run. Enforces a global cap on the total
- * number of subagent tasks executing simultaneously, regardless of each step's
- * per-step concurrency limit.
+ * 一个基于 Promise 实现的信号量（Semaphore），用于在单次运行中，跨多个 mapConcurrent 调用限制并发访问
+ * 它强制执行一个全局上限，控制同时执行的子 Agent 任务总数，而不受每个步骤自身并发限制的影响
  */
 export class Semaphore {
+	// 当前可用许可数（初始为 limit），大于 0 表示可以立即执行；等于 0 表示已满，新任务需要等待
 	private available: number;
+	// 等待队列（存储 resolve 函数），当有任务被阻塞时，它的 resolve 会被存入队列，等待释放时被调用
 	private readonly queue: Array<() => void> = [];
 
 	constructor(limit: number) {
+		// 初始化可用许可数，确保至少为 1
 		this.available = Math.max(1, Math.floor(limit) || 1);
 	}
 
+	// 获取一个许可，如果当前有可用许可，则立即返回；否则将当前任务阻塞，等待许可释放
 	acquire(): Promise<void> {
 		if (this.available > 0) {
 			this.available--;
 			return Promise.resolve();
 		}
+		// 如果当前没有可用许可，则创建一个 Promise，并将其 resolve 函数存入等待队列
 		return new Promise<void>((resolve) => {
 			this.queue.push(resolve);
 		});
 	}
 
+	// 释放一个许可，如果等待队列中有任务，则唤醒第一个等待者；否则增加可用许可数
 	release(): void {
+		// 从等待队列中取出第一个等待者，并调用其 resolve 函数
 		const next = this.queue.shift();
 		if (next) {
 			next();

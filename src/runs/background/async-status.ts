@@ -78,7 +78,24 @@ interface AsyncRunStepSummary {
 	children?: NestedRunSummary[];
 }
 
-// 后台 Subagent 任务的完整状态摘要，主要从 status.json 读取
+/* 
+AsyncRunSummary =
+任务身份
++ 当前状态
++ 进度
++ 超时和预算
++ Chain/Parallel 步骤
++ Session 文件
++ Token/费用
++ 嵌套子任务 
+
+从后台任务文件读取出来的运行摘要，主要从 status.json 读取
+用于：
+扫描任务目录
+恢复 Session
+判断任务是否仍在运行
+保存完整 Chain/Parallel 状态
+*/
 export interface AsyncRunSummary {
 	// 本次运行的唯一 ID
 	id: string;
@@ -133,6 +150,20 @@ export interface AsyncRunSummary {
 	turnBudgetExceeded?: boolean;
 	// 是否已要求 Agent 收尾总结
 	wrapUpRequested?: boolean;
+ 
+	/* 
+	例如：
+	Chain:
+	步骤 0：planner
+	步骤 1、2、3：并行 worker
+	步骤 4：reviewer
+
+	这时：
+	currentStep = 2;
+	chainStepCount = 5;
+	parallelGroups = [{ start: 1, count: 3 }]; 
+	*/
+
 	// 当前执行到第几个步骤
 	currentStep?: number;
 	// Chain 总步骤数
@@ -141,14 +172,68 @@ export interface AsyncRunSummary {
 	pendingAppends?: number;
 	// Chain 中哪些步骤组成并行组
 	parallelGroups?: AsyncParallelGroupStatus[];
+
+	/* 
+	step 是一次 Run 中可独立跟踪的最小执行单元，执行时通常会为该 step 启动独立的 Pi 子进程
+
+	1. Single
+
+	run-1
+	└── step 0：worker 修复登录问题
+
+	只有一个 step。
+
+	2. Parallel
+
+	run-1
+	├── step 0：分析前端
+	├── step 1：分析后端
+	└── step 2：分析测试
+
+	多个 step 同时执行，没有前后依赖。
+
+	3. Chain
+
+	run-1
+	├── step 0：planner 制定方案
+	├── step 1：worker 实现
+	└── step 2：reviewer 检查
+
+	多个 step 按顺序执行，后一步可以使用前一步结果。
+
+	4. Chain + Parallel Group
+
+	run-1
+	├── step 0：planner 制定方案
+	├── step 1：worker 修改前端 ┐
+	├── step 2：worker 修改后端 ┘ 同时执行
+	└── step 3：reviewer 检查
+
+	index 是 step 在整个 Run 中的稳定编号，不一定表示依赖关系。
+
+	AsyncRunStepSummary 就是记录每个 step 的：
+
+	Agent、任务状态、当前 Tool、Token、耗时、输出和错误
+
+	而 children 表示这个 step 内部又派生出的嵌套 Subagent Run。 
+	*/
 	// 每个子任务/步骤的状态摘要
 	steps: AsyncRunStepSummary[];
+
+	// 子 Agent Session 目录
 	sessionDir?: string;
+	// 最终输出文件
 	outputFile?: string;
+	// Input、Output 等 Token 总量
 	totalTokens?: TokenUsage;
+	// 模型调用总费用
 	totalCost?: CostSummary;
+	// 子 Agent JSONL Session 文件
 	sessionFile?: string;
+
+	// 当前任务派生的嵌套子任务
 	nestedChildren?: NestedRunSummary[];
+	// 嵌套任务恢复或解析时的警告
 	nestedWarnings?: string[];
 }
 

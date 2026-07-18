@@ -1348,14 +1348,22 @@ async function maybeBuildForegroundIntercomReceipt(input: {
 	};
 }
 
+// 输入合法，返回：null
+// 输入不合法，返回一个错误 AgentToolResult，后面不会启动子 Agent
 function validateExecutionInput(
-	params: SubagentParamsLike,
-	agents: AgentConfig[],
-	hasChain: boolean,
-	hasTasks: boolean,
-	hasSingle: boolean,
-	allowClarifyTaskPrompt: boolean,
+	params: SubagentParamsLike, // 用户最终参数
+	agents: AgentConfig[], // 当前发现的可用 Agent
+	hasChain: boolean, // 是否有 chain
+	hasTasks: boolean, // 是否有 parallel tasks
+	hasSingle: boolean, // 是否是 single
+	allowClarifyTaskPrompt: boolean, // 是否允许通过 TUI 补充第一步任务
 ): AgentToolResult<Details> | null {
+	/* 规则一：必须确定一种执行模式
+	不会报“多个模式”。
+	因为只要存在 tasks，hasSingle 就会变成 false。此时按照 parallel 处理，顶层 agent 基本被忽略。
+	所以它真正禁止的是：
+	tasks 和 chain 同时存在
+	三种模式一个都没确定 */
 	if (Number(hasChain) + Number(hasTasks) + Number(hasSingle) !== 1) {
 		return {
 			content: [
@@ -1369,6 +1377,7 @@ function validateExecutionInput(
 		};
 	}
 
+	// 规则二：验收配置必须合法，如果发现不合法，则返回错误，后面不会启动子 Agent
 	const acceptanceErrors = validateExecutionAcceptance(params);
 	if (acceptanceErrors.length > 0) {
 		return {
@@ -1378,6 +1387,7 @@ function validateExecutionInput(
 		};
 	}
 
+	// 规则三：Single 的 Agent 必须存在
 	if (hasSingle && params.agent && !agents.find((agent) => agent.name === params.agent)) {
 		return {
 			content: [{ type: "text", text: `Unknown agent: ${params.agent}` }],
@@ -1386,6 +1396,7 @@ function validateExecutionInput(
 		};
 	}
 
+	// 规则四：Parallel 中每个 Agent 必须存在
 	if (hasTasks && params.tasks) {
 		for (let i = 0; i < params.tasks.length; i++) {
 			const task = params.tasks[i]!;
@@ -1399,6 +1410,7 @@ function validateExecutionInput(
 		}
 	}
 
+	// 规则五：Chain 第一项必须能获得输入任务
 	if (hasChain && params.chain) {
 		if (params.chain.length === 0) {
 			return {
@@ -1408,6 +1420,7 @@ function validateExecutionInput(
 			};
 		}
 		const firstStep = params.chain[0] as ChainStep;
+		// 规则六：Chain 第一项是并行组时，每个任务都必须有 task
 		if (isParallelStep(firstStep)) {
 			const missingTaskIndex = firstStep.parallel.findIndex((t) => !t.task);
 			if (missingTaskIndex !== -1) {
@@ -1417,7 +1430,9 @@ function validateExecutionInput(
 					details: { mode: "chain" as const, results: [] },
 				};
 			}
-		} else if (isDynamicParallelStep(firstStep)) {
+		}
+		// 规则七：Chain 第一项不能是动态 Fanout
+		else if (isDynamicParallelStep(firstStep)) {
 			return {
 				content: [{ type: "text", text: "First step in chain cannot be dynamic fanout; expand.from requires a prior structured named output" }],
 				isError: true,
@@ -1430,6 +1445,7 @@ function validateExecutionInput(
 				details: { mode: "chain" as const, results: [] },
 			};
 		}
+		// 规则八：Chain 每一步使用的 Agent 都必须存在
 		for (let i = 0; i < params.chain.length; i++) {
 			const step = params.chain[i] as ChainStep;
 			const stepAgents = getStepAgents(step);
@@ -1637,8 +1653,13 @@ function expandChainParallelCounts(chain: ChainStep[]): { chain?: ChainStep[]; e
 }
 
 function normalizeRepeatedParallelCounts(params: SubagentParamsLike): { params?: SubagentParamsLike; error?: AgentToolResult<Details> } {
+	/* 展开重复的 Parallel 任务
+	如果任务有 count 属性，则展开成多个任务
+	如果链有 Parallel 步骤，则展开成多个步骤
+	 */
 	if (params.tasks) {
 		const expandedTasks = expandTopLevelTaskCounts(params.tasks);
+		// 如果展开任务时出错，则返回错误
 		if (expandedTasks.error) {
 			return { error: buildRequestedModeError(params, expandedTasks.error) };
 		}
@@ -1813,7 +1834,17 @@ function preflightForkSessionsForStaticTasks(
 	}
 }
 
+/*
+ * 尝试把本次执行请求交给后台 Runner。
+ * 返回 AgentToolResult 表示异步任务已启动或异步参数校验失败，调用方应直接把结果返回父 Agent；
+ * 返回 null 表示本次不走异步路径，createSubagentExecutor 会继续选择前台 chain/parallel/single。
+ */
 function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentToolResult<Details> | null {
+	/*
+	 * data 是 createSubagentExecutor 已经标准化的执行快照。
+	 * 这里不再重新解析用户原始输入，只取后台启动需要的工作目录、角色、会话、Artifact、
+	 * 通信路由、上下文策略和控制配置。
+	 */
 	const {
 		params,
 		effectiveCwd,
@@ -1832,11 +1863,18 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		nestedRoute,
 		contextPolicy,
 	} = data;
+	// 输入形状决定后台模式：chain 优先，其次 tasks 并行组，最后是单 Agent。
 	const hasChain = (params.chain?.length ?? 0) > 0;
 	const hasTasks = (params.tasks?.length ?? 0) > 0;
 	const hasSingle = !hasChain && !hasTasks && Boolean(params.agent);
+	// effectiveAsync 已考虑全局默认值和 clarify 限制；false 时交回前台路径处理。
 	if (!effectiveAsync) return null;
 
+	/*
+	 * Worktree 会给任务分配新的工作目录，因此 task 自己再指定 cwd 会产生归属冲突。
+	 * chain 和 parallel 在真正创建后台进程前先做静态检查，失败时直接返回工具错误，
+	 * 避免 detached runner 启动后才发现目录配置不合法。
+	 */
 	if (hasChain && params.chain) {
 		const chainWorktreeTaskCwdError = buildChainWorktreeTaskCwdError(params.chain as ChainStep[], effectiveCwd);
 		if (chainWorktreeTaskCwdError) {
@@ -1849,6 +1887,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 	}
 
 	if (hasTasks && params.tasks) {
+		// 顶层 parallel 还要限制任务总数，concurrency 只控制同时运行数，不能替代总数限制。最多 8 任务，4 并发
 		const maxParallelTasks = resolveTopLevelParallelMaxTasks(deps.config.parallel?.maxTasks);
 		if (params.tasks.length > maxParallelTasks) {
 			return buildParallelModeError(`Max ${maxParallelTasks} tasks`);
@@ -1859,6 +1898,11 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		}
 	}
 
+	/*
+	 * 异步模式需要用 jiti 启动独立 TypeScript Runner。
+	 * 当前环境没有 jiti 时不能悄悄降级到前台，否则 async=true 的生命周期语义会改变。
+	 * jiti 是一个专为 Node.js 设计的运行时工具，它的核心作用是让 Node.js 可以直接执行 TypeScript，而无需预先构建 js 文件
+	 */
 	if (!isAsyncAvailable()) {
 		return {
 			content: [{ type: "text", text: "Async mode requires upstream jiti for TypeScript execution but it could not be found. Ensure the pi-subagents package dependencies are installed." }],
@@ -1866,7 +1910,13 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			details: { mode: "single" as const, results: [] },
 		};
 	}
+	// 后台 run 使用完整 UUID。它同时作为状态目录、结果文件、intercom 地址和嵌套路由的身份。
 	const id = randomUUID();
+	/*
+	 * asyncCtx 保存 detached runner 启动时需要的父会话和模型环境。
+	 * currentSessionId 在 createSubagentExecutor 前半段已经写入 state，所以这里使用非空断言；
+	 * parentSessionId 用于建立父子关系，currentModel 则为未显式指定模型的角色提供继承来源。
+	 */
 	const asyncCtx = {
 		pi: deps.pi,
 		cwd: ctx.cwd,
@@ -1876,18 +1926,45 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		currentModel: ctx.model,
 		modelScope: data.modelScope,
 	};
+	// 把 ModelRegistry 转成可序列化模型信息，后台进程据此解析角色模型和 fallback。
 	const availableModels: ModelInfo[] = ctx.modelRegistry.getAvailable().map(toModelInfo);
 	const currentMaxSubagentDepth = resolveCurrentMaxSubagentDepth(deps.config.maxSubagentDepth);
 	const currentProvider = ctx.model?.provider;
+	/*
+	 * intercom 开启时，controlIntercomTarget 指向父编排器；childIntercomTarget 为每个叶子 step 生成唯一地址。
+	 * 后台 Runner 可用这些地址发送结果、控制通知，并把 steer 指令投递给正确子 Agent。
+	 */
 	const controlIntercomTarget = intercomBridge.active ? intercomBridge.orchestratorTarget : undefined;
 	const childIntercomTarget = intercomBridge.active ? (agent: string, index: number) => resolveSubagentIntercomTarget(id, agent, index) : undefined;
 
+	/*
+	 * tasks 是顶层 parallel 的简写。这里先为每项解析角色配置、模型覆盖、Skill、输出和预算，
+	 * 再包装成只有一个 parallel step 的 chain，复用已有的 executeAsyncChain 的并发、状态和结果汇总能力。
+		{
+		tasks: [
+			{ agent: "scout", task: "分析模块 A" },
+			{ agent: "reviewer", task: "检查模块 B" }
+		]
+		}
+		然后转换成：
+		{
+		chain: [
+			{
+			parallel: [
+				{ agent: "scout", task: "分析模块 A" },
+				{ agent: "reviewer", task: "检查模块 B" }
+			]
+			}
+		]
+		}
+	 */
 	if (hasTasks && params.tasks) {
 		const agentConfigs = params.tasks.map((task) => agents.find((agent) => agent.name === task.agent));
 		const modelOverrides = params.tasks.map((task, index) =>
 			resolveSubagentModelOverride(task.model ?? agentConfigs[index]?.model, ctx.model, availableModels, currentProvider, { scope: data.modelScope, source: task.model ? "explicit" : "inherited" }),
 		);
 		const skillOverrides = params.tasks.map((task) => normalizeSkillInput(task.skill));
+		// fork 角色的任务会包上 fork 提示；fresh 角色保留原任务文本。
 		const parallelTasks = params.tasks.map((task, index) => ({
 			agent: task.agent,
 			task: shouldForkAgent(contextPolicy, task.agent) ? wrapForkTask(task.task) : task.task,
@@ -1901,6 +1978,10 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			...(task.toolBudget !== undefined ? { toolBudget: task.toolBudget } : {}),
 			...(task.acceptance !== undefined ? { acceptance: task.acceptance } : {}),
 		}));
+		/*
+		 * executeAsyncChain 会写临时配置、spawn detached subagent-runner，并立即返回 started 结果和 runId。
+		 * 真正的 parallel 子 Pi 进程稍后由后台 Runner 创建；父 Agent 当前 turn 不等待它们完成。
+		 */
 		return executeAsyncChain(id, {
 			chain: [{
 				parallel: parallelTasks,
@@ -1936,6 +2017,11 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		});
 	}
 
+	/*
+	 * 原生 chain 保留 sequential、parallel 和 dynamic fanout 结构。
+	 * 这里只补齐全链 Skill、fork 包装、每个 flat step 的会话文件与 thinking override，
+	 * 然后把完整执行计划交给后台 Runner。
+	 */
 	if (hasChain && params.chain) {
 		const normalized = normalizeSkillInput(params.skill);
 		const chainSkills = normalized === false ? [] : (normalized ?? []);
@@ -1972,6 +2058,11 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		});
 	}
 
+	/*
+	 * single 模式先找到角色定义，再合并“调用参数 > 角色默认值 > 父模型继承”三层配置。
+	 * output、Skill、模型、thinking、最大嵌套深度和 sessionFile 都在前台确定，
+	 * 后台 Runner 因而拿到一份稳定、可恢复的启动快照。
+	 */
 	if (hasSingle) {
 		const a = agents.find((x) => x.name === params.agent);
 		if (!a) {
@@ -1981,6 +2072,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 				details: { mode: "single" as const, results: [] },
 			};
 		}
+		// output=true 表示使用角色默认路径；显式字符串覆盖默认值；未传时也继承角色配置。
 		const rawOutput = params.output !== undefined ? params.output : a.output;
 		const effectiveOutput = normalizeSingleOutputOverride(rawOutput, a.output);
 		const effectiveOutputMode = params.outputMode ?? "inline";
@@ -1988,6 +2080,11 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		const skills = normalizedSkills === false ? [] : normalizedSkills;
 		const maxSubagentDepth = resolveChildMaxSubagentDepth(currentMaxSubagentDepth, a.maxSubagentDepth);
 		const modelOverride = resolveSubagentModelOverride((params.model as string | undefined) ?? a.model, ctx.model, availableModels, currentProvider, { scope: data.modelScope, source: (params.model as string | undefined) ? "explicit" : "inherited" });
+		/*
+		 * executeAsyncSingle 与 chain 一样只负责启动 detached runner 并返回 runId。
+		 * 后台 Runner 最终仍会进入 runSubagent -> runSingleStep -> runPiStreaming，
+		 * 所以 single 和 chain 共享同一套事件、Artifact、验收和控制机制。
+		 */
 		return executeAsyncSingle(id, {
 			agent: params.agent!,
 			task: shouldForkAgent(contextPolicy, params.agent!) ? wrapForkTask(params.task ?? "") : (params.task ?? ""),
@@ -2023,6 +2120,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		});
 	}
 
+	// 理论上输入已在上游校验；没有识别到执行形状时返回 null，让调用方走最终 Invalid params 保护。
 	return null;
 }
 
@@ -3160,6 +3258,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		ctx: ExtensionContext,
 	) => Promise<AgentToolResult<Details>>;
 } {
+	/*
+	 * 工厂函数本身不执行子 Agent，而是把扩展 API、共享状态、配置和路径工具等依赖闭包保存下来。
+	 * 返回的 execute 才是注册给 Pi 的工具执行入口；每次模型调用 subagent 工具时，它都会收到本次参数、
+	 * 中止信号、流式更新回调和当前会话上下文，并在这里完成管理操作或启动新的子 Agent。
+	 */
 	const execute = async (
 		_id: string,
 		params: SubagentParamsLike,
@@ -3167,16 +3270,24 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		onUpdate: ((r: AgentToolResult<Details>) => void) | undefined,
 		ctx: ExtensionContext,
 	): Promise<AgentToolResult<Details>> => {
+		// 记录父 Agent 当前工作目录，并保证前台运行所需的共享容器已经初始化。
 		deps.state.baseCwd = ctx.cwd;
 		deps.state.foregroundRuns ??= new Map();
 		deps.state.foregroundControls ??= new Map();
 		deps.state.lastForegroundControlId ??= null;
+		// 兼容 action="single/parallel" 旧写法，再把用户传入的 cwd 解析成绝对路径。
 		const requestParams = omitExecutionModeActionAlias(params);
 		const requestCwd = resolveRequestedCwd(ctx.cwd, requestParams.cwd);
 		const paramsWithResolvedCwd = requestParams.cwd === undefined ? requestParams : { ...requestParams, cwd: requestCwd };
 		const action = paramsWithResolvedCwd.action;
+		/*
+		 * 带 action 的请求属于“管理现有运行”，例如 doctor、status、resume、steer、stop。
+		 * 这类请求不会创建普通 single/parallel/chain 任务，而是在下面对应分支中立即处理并返回。
+		 * 不带 action 的请求才会继续进入后半段的子 Agent 创建流程。
+		 */
 		if (action) {
 			if ((WATCHDOG_TOOL_ACTIONS as readonly string[]).includes(action)) {
+				// 子 Agent 的安全 fanout 模式禁止修改其他运行，避免子任务越权控制兄弟或父任务。
 				if (deps.allowMutatingManagementActions === false && MUTATING_MANAGEMENT_ACTIONS.has(action)) {
 					return {
 						content: [{ type: "text", text: `Action '${action}' is not available from child-safe subagent fanout mode.` }],
@@ -3187,6 +3298,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				return handleWatchdogToolAction(action, paramsWithResolvedCwd, ctx, deps.watchdog);
 			}
 			if (action === "doctor") {
+				// doctor 收集会话、配置、目录和 intercom 信息；读取失败也会转成报告，而不是让工具崩溃。
 				let currentSessionFile: string | null = null;
 				let currentSessionId = deps.state.currentSessionId;
 				let sessionError: string | undefined;
@@ -3222,6 +3334,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				};
 			}
 			if (action === "status") {
+				/*
+				 * status 可以看整个 fleet，也可以按 id 查看某次前台、后台或嵌套运行。
+				 * 前台运行状态保存在内存 state 中；后台运行状态主要从持久化运行目录读取。
+				 * nestedScope 和 sessionRoots 用来限制可查询范围，防止读取不属于当前会话的运行。
+				 */
 				const targetRunId = paramsWithResolvedCwd.id ?? paramsWithResolvedCwd.runId;
 				const nestedScope = nestedResolutionScopeForExecutor(deps);
 				const sessionRoots = trustedSessionRootsForStatus(ctx, deps);
@@ -3260,9 +3377,15 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				return inspectSubagentStatus(paramsWithResolvedCwd, { state: deps.state, nested: nestedScope, sessionRoots });
 			}
 			if (action === "resume") {
+				// 从已暂停或已结束的后台运行资料中恢复一个异步任务。
 				return resumeAsyncRun({ params: paramsWithResolvedCwd, requestCwd, ctx, deps });
 			}
 			if (action === "steer") {
+				/*
+				 * steer 给仍在运行的异步子 Agent 追加一条指导消息。
+				 * 它先按显式目录或 runId 定位目标，再区分 nested、foreground 和 async；
+				 * 当前只有 live async Pi child session 支持 steer。
+				 */
 				const message = (paramsWithResolvedCwd.message ?? paramsWithResolvedCwd.task ?? "").trim();
 				if (!message) return { content: [{ type: "text", text: "action='steer' requires message." }], isError: true, details: { mode: "management", results: [] } };
 				const targetRunId = paramsWithResolvedCwd.runId ?? paramsWithResolvedCwd.id;
@@ -3290,9 +3413,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				return steerAsyncRun({ state: deps.state, runId: resolved.id, message, index: paramsWithResolvedCwd.index, kill: deps.kill, location: resolved.location });
 			}
 			if (action === "append-step") {
+				// 给仍可扩展的异步 chain 追加后续步骤。
 				return appendStepToAsyncChain({ params: paramsWithResolvedCwd, requestCwd, ctx, deps });
 			}
 			if (action === "schedule" || action === "schedule-list" || action === "schedule-status" || action === "schedule-cancel") {
+				// 定时任务由外部注入的处理器负责；子上下文没有该处理器时直接拒绝。
 				if (!deps.handleScheduledRunAction) {
 					return {
 						content: [{ type: "text", text: `Action '${action}' is not available in this subagent context.` }],
@@ -3303,6 +3428,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				return deps.handleScheduledRunAction(paramsWithResolvedCwd, ctx);
 			}
 			if (action === "stop") {
+				/*
+				 * stop 终止后台运行。目标可以通过运行目录或 runId 指定。
+				 * foreground 使用 interrupt，nested 由其父级管理，所以这两个类型不能走 stop。
+				 */
 				const targetRunId = paramsWithResolvedCwd.runId ?? paramsWithResolvedCwd.id;
 				let resolved: ResolvedSubagentRunId | undefined;
 				if (paramsWithResolvedCwd.dir) {
@@ -3337,6 +3466,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				};
 			}
 			if (action === "interrupt") {
+				// interrupt 优先控制 nested/foreground；找不到前台控制器时再尝试中断 async 运行。
 				const targetRunId = paramsWithResolvedCwd.runId ?? paramsWithResolvedCwd.id;
 				let resolved: ResolvedSubagentRunId | undefined;
 				if (targetRunId) {
@@ -3378,6 +3508,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					details: { mode: "management", results: [] },
 				};
 			}
+			// 在调用通用管理处理器前，统一拒绝未知 action 和 child-safe 模式中的危险 action。
 			if (!(SUBAGENT_ACTIONS as readonly string[]).includes(action)) {
 				return {
 					content: [{ type: "text", text: `Unknown action: ${action}. Valid: ${SUBAGENT_ACTIONS.join(", ")}` }],
@@ -3399,6 +3530,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			});
 		}
 
+		/*
+		 * 从这里开始处理“创建一次新运行”。先检查 PI_SUBAGENT_CHILD 所表示的嵌套深度。
+		 * 达到 maxSubagentDepth 后禁止继续派生，避免子 Agent 无限递归创建子 Agent。
+		 */
 		const { blocked, depth, maxDepth } = checkSubagentDepth(deps.config.maxSubagentDepth);
 		if (blocked) {
 			return {
@@ -3416,20 +3551,65 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			};
 		}
 
+		/* 展开 parallel 的重复计数，并应用“顶层任务强制 async”等全局启动规则。
+		展开带 count 的并行任务。根据配置，强制顶层任务异步执行。
+
+		假设输入是：
+		{
+		  tasks: [
+			{
+			  agent: "scout",
+			  task: "分析代码",
+			  count: 3
+			}
+		  ]
+		}
+		normalizeRepeatedParallelCounts() 会把它展开成：
+		{
+		  tasks: [
+			{ agent: "scout", task: "分析代码" },
+			{ agent: "scout", task: "分析代码" },
+			{ agent: "scout", task: "分析代码" }
+		  ]
+		}
+		后面的执行器不用理解 count。它只需要看到三个真实任务，然后启动三个子 Agent。
+		它也会检查 count 是否合法：
+		count: 3      // 合法
+		count: 0      // 错误
+		count: 1.5    // 错误
+		count: "3"    // 错误
+
+		返回值有两种情况。
+		成功：
+		{
+		  params: 标准化后的参数
+		}
+		失败：
+		{
+		  error: AgentToolResult
+		} */
 		const normalized = normalizeRepeatedParallelCounts(paramsWithResolvedCwd);
+		// 如果 count 不合法，立刻返回错误，不再创建子 Agent
 		if (normalized.error) return normalized.error;
 		const normalizedParams = normalized.params!;
 
+		// 这一步决定是否强制异步运行，在配置 forceTopLevelAsync 为 true 时，会强制顶层任务异步运行
 		let effectiveParams = applyForceTopLevelAsyncOverride(
 			normalizedParams,
 			depth,
 			deps.config.forceTopLevelAsync === true,
 		);
+		// 分别解析本次请求和全局配置的工具预算；格式错误时按用户请求的 mode 返回错误。
 		const runToolBudget = resolveToolBudget(effectiveParams.toolBudget, "toolBudget");
 		if (runToolBudget.error) return buildRequestedModeError(effectiveParams, runToolBudget.error);
 		const configToolBudget = resolveToolBudget(deps.config.toolBudget, "config.toolBudget");
 		if (configToolBudget.error) return buildRequestedModeError(effectiveParams, configToolBudget.error);
 
+		/*
+		 * 在实际 cwd 和 agentScope 下发现可用角色，并补齐单 Agent 默认参数。
+		 * 随后解析 timeout、turn budget 和 fresh/fork 上下文策略。这些结果会统一放进 execData，
+		 * 让 single、parallel、chain 三条执行路径使用同一套运行配置。
+		 */
 		const scope: AgentScope = resolveExecutionAgentScope(effectiveParams.agentScope);
 		const effectiveCwd = effectiveParams.cwd ?? ctx.cwd;
 		const parentSessionFile = ctx.sessionManager.getSessionFile() ?? null;
@@ -3444,6 +3624,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		if (turnBudget.error) return buildRequestedModeError(effectiveParams, turnBudget.error);
 		const contextPolicy = resolveAgentDefaultContextPolicy(effectiveParams, discoveredAgents);
 		effectiveParams = contextPolicy.params;
+		// intercom bridge 为父子 Agent 生成可寻址的通信目标，并把通信能力注入角色配置。
 		const sessionName = resolveIntercomSessionTarget(deps.pi.getSessionName(), ctx.sessionManager.getSessionId());
 		const intercomBridge = resolveIntercomBridge({
 			config: deps.config.intercomBridge,
@@ -3453,6 +3634,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const agents = intercomBridge.active
 			? discoveredAgents.map((agent) => applyIntercomBridgeToAgent(agent, intercomBridge))
 			: discoveredAgents;
+		// 每次调用生成独立 runId；嵌套任务继承路由，顶层任务创建新的路由根。
 		const runId = randomUUID().slice(0, 8);
 		const inheritedNestedRoute = resolveInheritedNestedRouteFromEnv();
 		const nestedParentAddress = inheritedNestedRoute ? resolveNestedParentAddressFromEnv() : undefined;
@@ -3466,6 +3648,19 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			&& ctx.hasUI
 			&& !(effectiveParams.chain?.some(isParallelStep) ?? false);
 
+		/* 
+		确保 single、parallel、chain 三种输入互斥，并检查角色、任务和 clarify 组合是否合法。
+		clarify 表示：启动子 Agent 前，先让用户在 TUI 中确认或修改任务计划。
+		例如确认：
+		- 使用哪些 Agent
+		- 每个 Agent 做什么
+		- Chain 步骤顺序
+		- 是否并行执行
+		因为它需要当前 TUI 与用户实时交互，所以不能真正后台运行
+		- async=true，clarify=false → 后台运行
+		- async=true，clarify=true  → 强制前台交互
+		简单说：clarify 需要等用户操作，因此和 detached 异步运行冲突 
+		*/
 		const validationError = validateExecutionInput(
 			effectiveParams,
 			agents,
@@ -3476,6 +3671,15 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		);
 		if (validationError) return validationError;
 
+		/*
+		 * fork 模式需要从父会话为每个step解析可复用的 session 文件和 thinking 配置。
+		   “每个step”就是每个真正启动的子 Agent。每个子 Agent需要自己的 fork Session，避免多个子 Agent同时写一个会话文件。
+		 * fresh 模式则保留 undefined，后面会为子 Agent 新建 session.jsonl。
+		 * 父 Session
+			├─ fork → step 0 Session
+			├─ fork → step 1 Session
+			└─ fork → step 2 Session
+		 */
 		let forkSessionFileForIndex: (idx?: number) => string | undefined = () => undefined;
 		let forkThinkingOverrideForIndex: (idx?: number) => AgentConfig["thinking"] | undefined = () => undefined;
 		try {
@@ -3485,17 +3689,26 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		} catch (error) {
 			return toExecutionErrorResult(effectiveParams, error);
 		}
+		/*
+		 * clarify 需要当前 TUI 和用户交互，因此不能真正脱离当前 turn 在后台运行。
+		 * requestedAsync 保存用户原始意图；effectiveAsync 才是经过 clarify 约束后的实际模式。
+		 */
 		const requestedAsync = effectiveParams.async ?? deps.asyncByDefault;
 		const backgroundRequestedWhileClarifying = (hasChain || hasTasks) && requestedAsync && effectiveParams.clarify === true;
 		const effectiveAsync = requestedAsync && effectiveParams.clarify !== true;
 		const controlConfig = resolveControlConfig(deps.config.control, effectiveParams.control);
 
+		// Artifact 默认开启，用来保存输入、输出、元数据和 transcript，便于恢复、审计和验收。
 		const artifactConfig: ArtifactConfig = {
 			...DEFAULT_ARTIFACT_CONFIG,
 			enabled: effectiveParams.artifacts !== false,
 		};
 		const artifactsDir = getArtifactsDir(parentSessionFile, effectiveCwd);
 
+		/*
+		 * 一次 subagent 调用共享一个 sessionRoot，每个步骤再使用 run-0、run-1 等子目录。
+		 * 用户可显式指定 sessionDir，否则目录由父会话位置和 runId 推导。
+		 */
 		let sessionRoot: string;
 		if (effectiveParams.sessionDir) {
 			sessionRoot = path.resolve(deps.expandTilde(effectiveParams.sessionDir));
@@ -3514,6 +3727,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				new Error(`Failed to create session directory '${sessionRoot}': ${message}`),
 			);
 		}
+		// 这些小函数把“第几个step”稳定映射到会话目录、fresh 文件或 fork 文件。
 		const sessionDirForIndex = (idx?: number) =>
 			path.join(sessionRoot, `run-${idx ?? 0}`);
 		const forkSessionFileForTask = (agentName: string, idx?: number) =>
@@ -3525,6 +3739,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const childSessionFileForIndex = (idx?: number) =>
 			path.join(sessionDirForIndex(idx), "session.jsonl");
 		try {
+			// 真正 spawn 前先确认所有静态 fork 输入都存在，避免运行到一半才发现会话不可用。
 			preflightForkSessionsForStaticTasks(effectiveParams, contextPolicy, forkSessionFileForTask, deps.config.chain?.dynamicFanout?.maxItems);
 		} catch (error) {
 			return toExecutionErrorResult(effectiveParams, error);
@@ -3532,10 +3747,15 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const chainBindingsError = validateExecutionChainBindings(effectiveParams, deps.config.chain?.dynamicFanout?.maxItems);
 		if (chainBindingsError) return chainBindingsError;
 
+		// 给流式更新补上 fork 上下文信息，使 TUI 能正确展示子任务继承来源。
 		const onUpdateWithContext = onUpdate
 			? (r: AgentToolResult<Details>) => onUpdate(withForkContext(r, effectiveParams.context))
 			: undefined;
 
+		/*
+		 * 预留本次需要的 spawn 配额。并发上限在创建任何进程前统一检查，
+		 * 防止 parallel 或动态 chain 瞬间创建过多 Pi 子进程。
+		 */
 		const foregroundMode: "single" | "parallel" | "chain" = hasChain ? "chain" : hasTasks ? "parallel" : "single";
 		const spawnLimitError = reserveSubagentSpawns({
 			state: deps.state,
@@ -3546,6 +3766,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		});
 		if (spawnLimitError) return spawnLimitError;
 
+		/*
+		 * execData 是标准化后的执行快照。上面散落的用户参数、全局配置、会话路径、预算、
+		 * 通信路由和回调都在这里汇合，后面的不同执行模式不再重复解析这些信息。
+		 */
 		const execData: ExecutionContextData = {
 			params: effectiveParams,
 			effectiveCwd,
@@ -3575,24 +3799,54 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			modelScope,
 		};
 
+		/*
+		 * 只有前台运行需要内存中的 foregroundControl。status/interrupt 和 TUI 用它读取当前角色、
+		 * 工具及活动时间；异步运行由 detached runner 和磁盘 status.json 持有生命周期。
+		 * 前台任务和当前 Pi 进程绑定，所以状态可以放在内存里。
+			异步任务已经 detached。父 Agent 退出后，它还可能继续运行。内存一旦进程退出就没了，因此异步任务把状态写到磁盘：
+			async-run/
+			├── status.json
+			├── events.jsonl
+			├── output-0.log
+			└── result.json
+
+			因此两种生命周期不同：
+			前台任务
+			→ 当前进程持有
+			→ foregroundControls Map
+
+			异步任务
+			→ detached runner 持有
+			→ status.json + events.jsonl
+		 */
 		const foregroundControl = effectiveAsync
 			? undefined
 			: {
-				runId,
-				mode: foregroundMode,
-				startedAt: Date.now(),
-				updatedAt: Date.now(),
-				currentAgent: undefined,
-				currentIndex: undefined,
-				currentActivityState: undefined,
-				nestedRoute,
-				interrupt: undefined,
+				runId,                   // 当前运行 ID
+				mode: foregroundMode,    // single、parallel 或 chain
+				startedAt: Date.now(),   // 开始时间
+				updatedAt: Date.now(),   // 最近更新时间
+				currentAgent: undefined, // 当前正在运行的 Agent
+				currentIndex: undefined, // 当前步骤编号
+				currentActivityState: undefined, // 当前活动状态
+				nestedRoute,             // 嵌套父子 Agent 的通信路由
+				interrupt: undefined,    // 中断当前子进程的函数
 			};
+		// 保存到全局状态
 		if (foregroundControl) {
+			// foregroundControls 是一个 Map：runId → foregroundControl
+			// 以后执行下面的命令时：
+			// subagent({ action: "status", id: "abc123" })
+			// subagent({ action: "interrupt", id: "abc123" })
+			// 系统就可以根据 runId 找到这次前台运行。
 			deps.state.foregroundControls.set(runId, foregroundControl);
 			deps.state.lastForegroundControlId = runId;
 		}
 
+		/*
+		 * 当前执行器本身位于另一个子 Agent 中时，把本次孙级运行的开始和完成状态写入继承路由
+		 * 父级 watcher 因而可以看到整棵嵌套任务树，而不只看到直接子进程。
+		 */
 		const writeNestedForegroundEvent = (type: "subagent.nested.started" | "subagent.nested.completed", result?: AgentToolResult<Details>): void => {
 			if (!inheritedNestedRoute || !nestedParentAddress) return;
 			const now = Date.now();
@@ -3653,11 +3907,21 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			}
 		};
 
+		/*
+		 * 真正执行从这里开始。runAsyncPath 若接受请求，会立即返回后台 runId；否则继续执行前台路径。
+		 * 前台再按输入形状分派到 chain、parallel 或 single，并把结果补上 fork 上下文。
+		 * 所有异常统一转换为 AgentToolResult，finally 始终清理前台控制状态。
+		 */
 		let nestedForegroundStarted = false;
 		try {
+			// runAsyncPath 是异步执行的，会立即返回后台 runId；否则继续执行前台路径。
 			const asyncResult = runAsyncPath(execData, deps);
+			// 如果异步执行成功，则返回结果，并补上 fork 上下文
 			if (asyncResult) return withForkContext(asyncResult, effectiveParams.context);
+			// 异步路径未接管，任务将以前台方式执行；若这是嵌套任务，记录前台子任务开始事件
+			// 后台任务不用这里记录。后台 Runner 会通过自己的 status.json 和 nested event 记录生命周期
 			if (foregroundControl) {
+				// 如果当前任务是“子 Agent创建的孙 Agent”，就通知根 Agent：孙 Agent现在开始运行了
 				writeNestedForegroundEvent("subagent.nested.started");
 				nestedForegroundStarted = true;
 			}
@@ -3697,6 +3961,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		}, effectiveParams.context);
 	};
 
+	/*
+	 * Pi 可能在同一 turn 中重复发出 subagent 工具调用。这个外层守卫只允许一个“新执行”请求在途，
+	 * 防止重复 spawn；status、wait、stop 等带 action 的管理请求不受此限制。
+	 * finally 保证成功、失败或中止后都能释放锁。
+	 */
 	const executeWithSingleDispatchGuard = async (
 		id: string,
 		params: SubagentParamsLike,
@@ -3715,5 +3984,6 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		}
 	};
 
+	// 对外只暴露带重复调用保护的入口，内部 execute 不直接注册给 Pi。
 	return { execute: executeWithSingleDispatchGuard };
 }

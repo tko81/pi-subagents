@@ -668,10 +668,10 @@ export interface NestedRunSummary extends NestedRunAddress {
 }
 
 export interface NestedRouteInfo {
-	rootRunId: string;
-	eventSink: string;
-	controlInbox: string;
-	capabilityToken: string;
+	rootRunId: string; // 整棵任务树的根运行 ID
+	eventSink: string; // 子孙 Agent 向上写状态事件的目录
+	controlInbox: string; // 根 Agent 向下发送控制命令的目录
+	capabilityToken: string; // 防止其他进程伪造事件或控制命令
 }
 
 export interface AsyncStartedEvent {
@@ -788,6 +788,21 @@ export type AsyncJobStep = NonNullable<AsyncStatus["steps"]>[number] & {
 	index?: number;
 };
 
+/* 主 Agent 内存中用于 Tracker 和 Widget 的状态：
+AsyncRunSummary
+→ summaryToJob()
+→ AsyncJobState
+→ state.asyncJobs
+用于：
+实时更新 UI
+管理 Poller
+显示当前可见步骤
+记录清理状态
+与 AsyncRunSummary 字段相似，是因为描述的是同一个任务 
+可以理解成：
+AsyncRunSummary = 数据库/文件 DTO
+AsyncJobState   = UI 使用的内存 ViewModel
+*/
 export interface AsyncJobState {
 	asyncId: string;
 	asyncDir: string;
@@ -1208,6 +1223,12 @@ export function resolveChildMaxSubagentDepth(parentMaxDepth: number, agentMaxDep
 }
 
 export function checkSubagentDepth(configMaxDepth?: number): { blocked: boolean; depth: number; maxDepth: number } {
+	/* 检查子 Agent 的嵌套深度
+	PI_SUBAGENT_DEPTH 是子 Agent 的嵌套深度，每次子 Agent 创建时会递增
+	PI_SUBAGENT_MAX_DEPTH 是子 Agent 的最大嵌套深度，由用户配置或默认值决定
+	如果子 Agent 的嵌套深度大于等于最大嵌套深度，则返回 blocked: true，表示子 Agent 创建失败
+	如果子 Agent 的嵌套深度小于最大嵌套深度，则返回 blocked: false，表示子 Agent 创建成功
+	 */
 	const depth = Number(process.env.PI_SUBAGENT_DEPTH ?? "0");
 	const maxDepth = resolveCurrentMaxSubagentDepth(configMaxDepth);
 	const blocked = Number.isFinite(depth) && depth >= maxDepth;
