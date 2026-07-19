@@ -810,10 +810,14 @@ async function runSingleAttempt(
 		let stderrBuf = "";
 
 		const clearStdioGuard = attachPostExitStdioGuard(proc, { idleMs: 2000, hardMs: 8000 });
+		// 监听 stdout 数据
 		proc.stdout.on("data", (d) => {
+			// 把数据添加到缓冲区
 			buf += d.toString();
+			// 把缓冲区按行分割
 			const lines = buf.split("\n");
 			buf = lines.pop() || "";
+			// 处理每一行
 			lines.forEach(processLine);
 		});
 		proc.stderr.on("data", (d) => {

@@ -484,8 +484,11 @@ function runPiStreaming(
 		 * 同时更新 transcript、可读日志、最终 messages、模型名和 Token/费用统计。
 		 */
 		const processStdoutLine = (line: string) => {
+			// 如果行不为空，则直接返回
 			if (!line.trim()) return;
+			// 尝试解析行
 			let event: ChildEvent;
+			// 如果解析失败，则把行添加到 rawStdoutLines 数组中，并写入可读输出文件
 			try {
 				event = JSON.parse(line) as ChildEvent;
 			} catch {
@@ -495,12 +498,16 @@ function runPiStreaming(
 				return;
 			}
 
+			// 添加子事件
 			appendChildEvent(event);
+			// 写入子事件到 transcript
 			transcriptWriter?.writeChildEvent(event);
 
 			// Watchdog 仍在跟进任务时不能过早结束子进程，需要延长尾部等待时间。
 			if (isChildWatchdogStatusEvent(event)) {
+				// 如果子 Agent 的 watchdog 配置不存在，则直接返回
 				if (!childWatchdogConfig) return;
+				// 接受子 Agent 的 watchdog 事件
 				const next = acceptChildWatchdogEvent({
 					current: childWatchdogState,
 					event,
@@ -509,9 +516,13 @@ function runPiStreaming(
 					childIndex: childEventContext?.stepIndex,
 				});
 				if (!next) return;
+				// 更新子 Agent 的 watchdog 状态
 				updateChildWatchdogState(next);
+				// 触发子 Agent 事件
 				onChildEvent?.(event);
+				// 如果子 Agent 的 watchdog 状态活跃，则更新尾部等待时间
 				if (childWatchdogIsActive(next)) {
+					// 如果最终排水计时器存在，则清除它
 					if (finalDrainTimer) {
 						clearTimeout(finalDrainTimer);
 						finalDrainTimer = undefined;
@@ -544,14 +555,22 @@ function runPiStreaming(
 			 * 说明 Agent Loop 已给出最终回答，可以启动进程退出保护计时器。
 			 */
 			if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
+				// message_end 表示消息结束，tool_result_end 表示工具结果结束
+				// 把消息添加到 messages 数组中
 				messages.push(event.message);
+				// 提取消息内容中的文本
 				const text = extractTextFromContent(event.message.content);
+				// 如果文本不为空，则写入可读输出文件
 				if (text) writeOutputText(text);
-
+				// 如果消息类型不是 message_end 或消息角色不是 assistant，则直接返回
 				if (event.type !== "message_end" || event.message.role !== "assistant") return;
+				// 更新模型
 				if (event.message.model) model = event.message.model;
+				// 更新助手错误消息
 				if (event.message.errorMessage) assistantError = event.message.errorMessage;
+				// 更新使用情况
 				const eventUsage = event.message.usage;
+				// 如果使用情况不为空，则更新使用情况
 				if (eventUsage) {
 					usage.turns++;
 					usage.input += eventUsage.input ?? eventUsage.inputTokens ?? 0;
@@ -560,6 +579,7 @@ function runPiStreaming(
 					usage.cacheWrite += eventUsage.cacheWrite ?? 0;
 					usage.cost += eventUsage.cost?.total ?? 0;
 				}
+				// 如果消息是终端助手停止消息，则更新助手错误消息
 				if (isTerminalAssistantStop(event.message)) {
 					if (!event.message.errorMessage && extractTextFromContent(event.message.content).trim()) assistantError = undefined;
 					cleanTerminalAssistantStopReceived ||= !event.message.errorMessage;
@@ -972,7 +992,7 @@ async function runSingleStep(
 }> {
 	/*
 	 * importAsyncRoot 不是再启动一个 Pi，而是把已经运行的异步根任务接入当前 chain。
-	 * 当前步骤等待那个外部 run 完成，并把祖先 timeout/stop 转发过去；完成后直接复用其输出、
+	 * 当前 step 等待那个外部 run 完成，并把祖先 timeout/stop 转发过去；完成后直接复用其输出、
 	 * session、模型、费用和验收结果，然后提前返回。
 	 */
 	if (step.importAsyncRoot) {
@@ -1559,6 +1579,25 @@ function combinedAbortSignal(signals: Array<AbortSignal | undefined>): AbortSign
 	return controller.signal;
 }
 
+/* 
+读取运行配置
+    ↓
+创建 status.json 和 events.jsonl
+    ↓
+监听 interrupt / stop / timeout / steer
+    ↓
+依次处理 Chain 中的步骤
+    ↓
+每个步骤启动一个或多个子 Pi
+    ↓
+记录工具、消息、Token 和运行状态
+    ↓
+把当前步骤结果传给下一步
+    ↓
+汇总所有结果
+    ↓
+写入最终 result.json 
+*/
 async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	/*
 	 * 后台 Runner 的总编排入口。一个 detached runner 进程只调用它一次，并由它持有整场运行的生命周期。
@@ -1836,7 +1875,14 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	// 所有状态更新都走这个入口，保证 status.json 与嵌套事件看到同一份快照。
 	const writeStatusPayload = (): void => {
 		refreshWorkflowGraph();
+		// 写当前 Runner 自己的 status.json
 		writeAtomicJson(statusPath, statusPayload);
+		// 如果当前 Runner 是另一个子 Agent 的后代，同步向祖先事件路由投影自己的状态
+		// 孙 Agent 的 statusPayload
+        // ├── 写入孙 Agent 自己的 status.json
+        // └── 提取状态摘要，写入嵌套事件通道
+        //                  ↓
+        //            子/根 Agent 查看
 		emitNestedSelfEvent(statusPayload.state === "running" || statusPayload.state === "queued" ? "subagent.nested.updated" : "subagent.nested.completed");
 	};
 	// runPiStreaming 启动和结束时分别注册、注销控制函数；若顶层已收到信号，新注册者立即执行。
@@ -1848,6 +1894,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		activeChildInterrupts.set(flatIndex, interrupt);
 		if (interrupted) interrupt();
 	};
+	// 注册步骤超时控制函数
 	const registerStepTimeout = (flatIndex: number, interrupt: (() => void) | undefined): void => {
 		if (!interrupt) {
 			activeChildTimeouts.delete(flatIndex);
@@ -1984,6 +2031,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			}
 		}
 	};
+	/*
+	 * 并行调度器可能准备启动某个任务时，顶层 run 已经暂停、超时或停止。
+	 * 这三个构造器为“尚未真正 spawn 的步骤”生成统一结果，使后面的结果汇总不需要特殊处理空值。
+	 */
 	const pausedStepResult = (agent: string): SingleStepResult => ({
 		agent,
 		output: "Paused after interrupt. Waiting for explicit next action.",
@@ -2044,6 +2095,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			}));
 		}
 	};
+	// dynamic group 没有固定 flat step，单独把组级状态和验收同步到 workflowGraph 父节点。
 	const markDynamicGraphGroup = (stepIndex: number, status: "completed" | "failed" | "running" | "stopped", error?: string, acceptance?: import("../../shared/types.ts").AcceptanceLedger): void => {
 		const groupNode = statusPayload.workflowGraph?.nodes.find((node) => node.id === `step-${stepIndex}`);
 		if (!groupNode) return;
@@ -2052,6 +2104,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		groupNode.acceptanceStatus = acceptance?.status ?? groupNode.acceptanceStatus;
 	};
 
+	/*
+	 * 活动时间不能只看 JSON 事件。有些子进程仍在持续写 output-N.log，但暂时没有发结构化事件。
+	 * 因此取“状态记录时间”和“输出文件修改时间”的最大值，减少把正常长任务误判为卡死。
+	 */
 	const stepOutputActivityAt = (index: number): number => {
 		const step = statusPayload.steps[index];
 		let lastActivityAt = step?.lastActivityAt ?? step?.startedAt ?? overallStartTime;
@@ -2065,6 +2121,11 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		}
 		return lastActivityAt;
 	};
+	/*
+	 * 这些数组都按 flat step 索引对齐。
+	 * emittedControlEventKeys 防重复通知；activeLongRunningSteps 保证长任务提示只触发一次；
+	 * pendingToolResults 和 mutatingFailureStates 组合判断连续的写文件/命令工具失败。
+	 */
 	const emittedControlEventKeys = new Set<string>();
 	const activeLongRunningSteps = new Set<number>();
 	const mutatingFailureStates = initialStatusSteps.map(() => createMutatingFailureState());
@@ -2075,12 +2136,17 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	 * 事件写入 events.jsonl，并按配置投递到父 TUI 或 intercom；去重键防止重复提醒。
 	 */
 	const appendControlEvent = (event: ReturnType<typeof buildControlEvent>) => {
+		// 如果控制面未启用，则直接返回
 		if (!controlConfig.enabled) return;
+		// 获取子 Agent 的 intercom 目标
 		const childIntercomTarget = config.childIntercomTargets?.[event.index ?? statusPayload.currentStep];
+		// 根据事件类型，确定通知渠道
 		const channels = event.type === "active_long_running"
 			? controlConfig.notifyChannels.filter((channel) => channel !== "intercom")
 			: controlConfig.notifyChannels;
+		// 如果通知渠道为空，或者通知已发送过，则直接返回
 		if (channels.length === 0 || !claimControlNotification(controlConfig, event, emittedControlEventKeys, childIntercomTarget)) return;
+		// 写入事件
 		appendJsonl(eventsPath, JSON.stringify({
 			type: "subagent.control",
 			event,
@@ -2095,6 +2161,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			} : {}),
 		}));
 	};
+	// 并行时可能多个步骤同时用工具；顶层状态展示最近启动的那个，详细状态仍保留在各 step 中。
 	const syncTopLevelCurrentTool = (): void => {
 		const activeStep = statusPayload.steps
 			.filter((step) => step.status === "running" && typeof step.currentTool === "string" && step.currentTool.length > 0)
@@ -2103,6 +2170,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		statusPayload.currentToolStartedAt = activeStep?.currentToolStartedAt;
 		statusPayload.currentPath = activeStep?.currentPath;
 	};
+	// 检查当前是否存在长时间运行的步骤，如果存在，则发送通知
 	const maybeEmitActiveLongRunning = (flatIndex: number, now: number): boolean => {
 		if (!controlConfig.enabled || activeLongRunningSteps.has(flatIndex)) return false;
 		const step = statusPayload.steps[flatIndex];
@@ -2171,6 +2239,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			statusPayload.lastUpdate = now;
 			writeStatusPayload();
 		}
+		// subagent.steer.requested 事件，表示子 Agent 请求了 steer 操作，可能是来自父 Agent 的控制，也可能是来自子 Agent 自己的控制
 		appendJsonl(eventsPath, JSON.stringify({
 			type: "subagent.steer.requested",
 			ts: now,
@@ -2183,6 +2252,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			...(rejected.length ? { rejected } : {}),
 		}));
 	};
+	// 刷新 pendingStepSteers 队列，把目标索引为 flatIndex 的请求传递给 deliverSteerRequest
 	const flushPendingStepSteers = (flatIndex: number): void => {
 		const remaining: SteerRequest[] = [];
 		for (const request of pendingStepSteers.splice(0)) {
@@ -2192,6 +2262,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		}
 		pendingStepSteers.push(...remaining);
 	};
+	// 更新 step 的模型、思考和更新时间
 	const updateStepModel = (flatIndex: number, model: string | undefined, thinking: string | undefined, now = Date.now()): void => {
 		const step = statusPayload.steps[flatIndex];
 		if (!step) return;
@@ -2200,6 +2271,11 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		statusPayload.lastUpdate = now;
 		writeStatusPayload();
 	};
+	/*
+	 * Turn Budget 分软限制和硬限制。
+	 * 达到 maxTurns 时先标记 wrap-up-requested，让子 Agent 有 graceTurns 收尾；超过宽限且仍未自然 stop，
+	 * 才调用该步骤注册的 abort，最终由 runPiStreaming 发送 SIGINT/SIGTERM/SIGKILL。
+	 */
 	const updateStepTurnBudget = (flatIndex: number, turnCount: number, now: number, terminalAssistantStop: boolean): void => {
 		const budget = config.turnBudget;
 		const step = statusPayload.steps[flatIndex];
@@ -2231,14 +2307,25 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		statusPayload.wrapUpRequested = true;
 		statusPayload.error = message;
 		statusPayload.lastUpdate = now;
+		// subagent.step.turn_budget_exceeded，表示步骤的 turn 预算已超出
 		appendJsonl(eventsPath, JSON.stringify({ type: "subagent.step.turn_budget_exceeded", ts: now, runId: id, stepIndex: flatIndex, agent: step.agent, turnCount, maxTurns: budget.maxTurns, graceTurns: budget.graceTurns, message }));
 		activeChildTurnBudgetAborts.get(flatIndex)?.(message, exceededState);
 	};
+	/*
+	 * 把 runPiStreaming 转发的 ChildEvent 归约到 statusPayload。
+	 * tool start/end 更新当前工具和路径；tool result 更新预算及连续修改失败；assistant message 累计 turn/Token；
+	 * watchdog 事件更新尾任务状态。每次有效事件最后都会刷新活动时间并原子写入 status.json。
+	 */
 	const updateStepFromChildEvent = (flatIndex: number, event: ChildEvent): void => {
+		// 获取扁平索引对应的 step 状态
 		const step = statusPayload.steps[flatIndex];
+		// 如果 step 不存在，则直接返回
 		if (!step) return;
+		// 获取当前时间
 		const now = Date.now();
+		// 更新当前 step 索引
 		statusPayload.currentStep = flatIndex;
+		// 如果是子 Agent 的 watchdog 状态事件
 		if (isChildWatchdogStatusEvent(event)) {
 			const next = acceptChildWatchdogEvent({
 				current: step.watchdog,
@@ -2255,6 +2342,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			writeStatusPayload();
 			return;
 		}
+		// tool_execution_start，表示工具执行开始
 		if (event.type === "tool_execution_start" && event.toolName) {
 			const mutates = isMutatingTool(event.toolName, event.args);
 			const currentPath = resolveCurrentPath(event.toolName, event.args);
@@ -2353,6 +2441,11 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		maybeEmitActiveLongRunning(flatIndex, now);
 		writeStatusPayload();
 	};
+	/*
+	 * 定时活动检查是事件流之外的兜底。
+	 * 它每秒检查所有 running step 的最近输出时间，推导 active_long_running 或 needs_attention，
+	 * 再把各步骤的最严重状态提升为整个 run 的 activityState。
+	 */
 	const updateRunnerActivityState = (now: number): boolean => {
 		if (!controlConfig.enabled) return false;
 		let changed = false;
@@ -2409,6 +2502,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		if (changed) writeStatusPayload();
 		return changed;
 	};
+	// unref 让这个监控定时器本身不会阻止 Runner 在任务完成后退出。
 	if (controlConfig.enabled) {
 		activityTimer = setInterval(() => {
 			if (statusPayload.state !== "running") return;
@@ -2418,6 +2512,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		activityTimer.unref?.();
 	}
 
+	/*
+	 * interrupt 是“可恢复暂停”：run 状态变成 paused，当前步骤 exitCode 仍可保持 0，
+	 * 然后把中断传播给所有直接子进程和嵌套后代。之后可通过 resume 创建后续运行。
+	 */
 	const interruptRunner = () => {
 		consumeInterruptRequest(asyncDir);
 		if (interrupted || statusPayload.state !== "running") return;
@@ -2445,6 +2543,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		interruptNestedAsyncDescendants();
 		interruptActiveChildren();
 	};
+	/*
+	 * stop 是用户明确终止：running 和 pending 步骤都标为 stopped/exitCode=1，
+	 * 同时中止验收等本地异步工作，并向所有直接子进程和嵌套后代传播停止请求；它不可原地恢复。
+	 */
 	const stopRunner = () => {
 		if (stopped || timedOut || interrupted || statusPayload.state !== "running") return;
 		stopped = true;
@@ -2477,6 +2579,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		stopNestedAsyncDescendants();
 		stopActiveChildren();
 	};
+	/*
+	 * timeout 是系统失败终止，传播方式与 stop 相似，但最终状态为 failed + timedOut。
+	 * 使用独立 AbortController，可让 runSingleStep 正在执行的 acceptance 等操作也及时停止。
+	 */
 	const timeoutRunner = () => {
 		if (timedOut || stopped || interrupted || statusPayload.state !== "running") return;
 		timedOut = true;
@@ -2531,11 +2637,16 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			else pendingStepSteers.push(request);
 		},
 	});
+	/*
+	 * deadlineAt 是父进程启动时计算的绝对时间，而不是 Runner 此刻重新计算的 timeout。
+	 * 这样 spawn 和调度消耗的时间也计入总预算；若启动时已过期，remainingMs=0 会立即超时。
+	 */
 	if (config.deadlineAt !== undefined) {
 		const remainingMs = Math.max(0, config.deadlineAt - Date.now());
 		timeoutTimer = setTimeout(timeoutRunner, remainingMs);
 		timeoutTimer.unref?.();
 	}
+	// 初始 status.json 已写好后再发布 started 事件，watcher 收到事件时一定能读取完整初始快照。
 	appendJsonl(
 		eventsPath,
 		JSON.stringify({
@@ -2598,6 +2709,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				break;
 			}
 
+			/*
+			 * 上游数组为空不是执行错误。无需 spawn 子 Agent，直接产生空集合并写入 collect.as；
+			 * 但显式 group acceptance 仍要运行，因为业务规则可能不接受空结果。
+			 */
 			if (materialized.parallel.length === 0) {
 				const now = Date.now();
 				const collection = materialized.collectedOnEmpty ?? [];
@@ -2678,6 +2793,11 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				};
 			});
 			const dynamicFlatStepCount = Math.max(statusPayload.steps.length - 1 + dynamicSteps.length, 1);
+			/*
+			 * 动态数量现在已知，用真实 N 个状态节点替换启动时的单个占位节点。
+			 * 替换后还要同步移动后续 parallelGroups、workflowGraph flatIndex、控制状态数组和 intercom 地址，
+			 * 保证所有模块继续用同一个 flat index 指向同一个子 Agent。
+			 */
 			const dynamicStatusSteps: RunnerStatusStep[] = dynamicSteps.map((task, itemIndex) => {
 				const transcriptPath = resolveAsyncStepTranscriptPath({ artifactsDir, artifactConfig, runId: id, agent: task.agent, flatIndex: groupStartFlatIndex + itemIndex, flatStepCount: dynamicFlatStepCount });
 				return {
@@ -2743,6 +2863,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			const concurrency = step.concurrency ?? MAX_PARALLEL_CONCURRENCY;
 			const failFast = step.failFast ?? false;
 			let aborted = false;
+			// mapConcurrent 同时应用组内 concurrency 和跨组 globalSemaphore，返回顺序仍与输入 item 顺序一致。
 			const parallelResults = await mapConcurrent(dynamicSteps, concurrency, async (task, taskIdx) => {
 				const fi = groupStartFlatIndex + taskIdx;
 				if (timedOut) return timedOutStepResult(task.agent);
@@ -3027,6 +3148,11 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					runId: id,
 					stepIndex,
 				});
+				/*
+				 * 静态并行组的每个 task 都走同一个 runSingleStep。
+				 * 回调负责把步骤置为 running、注册控制器、接收流式事件，并在完成后把结果写回对应 flat step；
+				 * mapConcurrent 等全部任务完成后，才进行组级汇总和 acceptance。
+				 */
 				const parallelResults = await mapConcurrent(
 					group.parallel,
 					concurrency,
@@ -3241,6 +3367,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						attemptedModels: r.attemptedModels,
 					})),
 				);
+				// 并行输出成为下一串行步骤的 {previous}；worktree 模式还附加每个分支的 Git diff 摘要。
 				previousOutput = appendParallelWorktreeSummary(previousOutput, worktreeSetup, asyncDir, stepIndex, group);
 
 				appendJsonl(eventsPath, JSON.stringify({
@@ -3255,6 +3382,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					break;
 				}
 			} finally {
+				// 成功、失败、暂停或超时都要回收临时 worktree，避免工作目录和 Git 元数据泄漏。
 				if (worktreeSetup) cleanupWorktrees(worktreeSetup);
 			}
 		} else {
@@ -3313,6 +3441,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				latestSessionFile = seqStep.sessionFile;
 			}
 
+			// 这是 chain 串行传值的核心：下一步中的 {previous} 会由 runSingleStep 替换成这里的输出。
 			previousOutput = singleResult.output;
 			const childStopped = singleResult.stopped === true;
 			results.push({
@@ -3437,6 +3566,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			}
 
 			flatIndex++;
+			// 串行链中任一步失败就停止后续步骤，避免后续 Agent 基于无效 previousOutput 继续执行。
 			if (singleResult.exitCode !== 0) {
 				break;
 			}
